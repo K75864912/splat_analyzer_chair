@@ -32,9 +32,9 @@ from renderers import get_renderer
 
 # Number of camera views rendered in a single GPU call (RGB pass).
 # Increase if you have lots of VRAM; decrease if you hit OOM.
-RENDER_BATCH = 32
+RENDER_BATCH = 64
 # Parallel threads for PNG / NPY disk writes.
-IO_WORKERS = 4
+IO_WORKERS = 16
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +288,7 @@ def _legacy_circle_positions(center: np.ndarray, radius: float,
 
 
 def _generate_camera_positions(means_np: np.ndarray, n_positions: int,
-                               cfg: PipelineConfig):
+                               cfg: PipelineConfig, center_override: np.ndarray = None):
     """
     Density-aware, blue-noise camera placement.
 
@@ -307,8 +307,19 @@ def _generate_camera_positions(means_np: np.ndarray, n_positions: int,
     means_np = np.asarray(means_np, dtype=np.float64)
 
     # ── 1. Robust bounding box (percentiles reject floater outliers) ────────
-    lo = np.percentile(means_np, cfg.bbox_pct_lo, axis=0)
-    hi = np.percentile(means_np, cfg.bbox_pct_hi, axis=0)
+    #lo = np.percentile(means_np, cfg.bbox_pct_lo, axis=0)
+    #hi = np.percentile(means_np, cfg.bbox_pct_hi, axis=0)
+    
+    # === v3: if --center and --cam_radius are provided, use them to define the bounding box ===
+    if center_override is not None and getattr(cfg, 'camera_radius', None) is not None:
+        lo = center_override - cfg.camera_radius
+        hi = center_override + cfg.camera_radius
+        print(f"[render_cameras] Bounding box locked to local node radius: {cfg.camera_radius:.2f}m")
+    else:
+        # fallback to original percentile-based bounding box if no overrides are provided
+        lo = np.percentile(means_np, cfg.bbox_pct_lo, axis=0)
+        hi = np.percentile(means_np, cfg.bbox_pct_hi, axis=0)
+    
     diag = float(np.linalg.norm(hi - lo))
     if diag <= 0.0:
         diag = 1.0
@@ -502,6 +513,14 @@ def render_views(ply_path: str, job_dir: str, cfg: PipelineConfig | None = None)
     print(f"[render] Renderer: {renderer.name}  (device={device})")
 
     center, radius = _scene_bounds(means_np)
+    # === v2新增：强制覆盖中心点和半径 ===
+    if getattr(cfg, 'manual_center_x', None) is not None:
+        center = np.array([cfg.manual_center_x, cfg.manual_center_y, cfg.manual_center_z])
+    #if getattr(cfg, 'manual_radius', None) is not None:
+        #radius = cfg.manual_radius
+    if getattr(cfg, 'scene_radius', None) is not None:
+        radius = cfg.scene_radius
+    # === #
     print(f"[render] Scene center={center.round(3)}, radius={radius:.3f}")
 
     # Camera intrinsics — 130° horizontal FoV
@@ -515,22 +534,89 @@ def render_views(ply_path: str, job_dir: str, cfg: PipelineConfig | None = None)
         dtype=torch.float32, device=device,
     )
 
-    cam_positions, look_targets = _generate_camera_positions(means_np, n_positions, cfg)
+    # cam_positions, look_targets = _generate_camera_positions(means_np, n_positions, cfg)
+    
+    # === v3.1: Support multi-node scanning if scan_nodes are provided in the config ===
+    # ---------------------------------------------------------
+    # Auto-generate scan nodes if explicit nodes were not provided
+    # ---------------------------------------------------------
+    scan_nodes = getattr(cfg, 'scan_nodes', None)
+    num_nodes = getattr(cfg, 'num_nodes', 1)
+    
+    if not scan_nodes or len(scan_nodes) == 0:
+        scan_nodes = [center.tolist()] # Node 0 is always the center
+        
+        if num_nodes > 1:
+            # Calculate a safe spread radius to prevent cameras from clipping through walls
+            spread_radius = radius * getattr(cfg, 'node_spread_frac', 0.40)
+            print(f"[render] Auto-generating {num_nodes-1} additional nodes at {spread_radius:.2f}m spread...")
+            
+            for i in range(num_nodes - 1):
+                # Distribute evenly in a circle on the XZ plane (Y remains the same to keep height flat)
+                angle = 2.0 * math.pi * i / (num_nodes - 1)
+                nx = center[0] + spread_radius * math.cos(angle)
+                ny = center[1]  
+                nz = center[2] + spread_radius * math.sin(angle)
+                scan_nodes.append([nx, ny, nz])
+
+    # ---------------------------------------------------------
+    # Execute camera placement for all nodes
+    # ---------------------------------------------------------
+    from dataclasses import replace
+    cam_positions_list = []
+    look_targets_list = []
+    camera_node_indices = []
+    # Local cube half-width in scene units; explicit --cam_radius takes precedence.
+    local_radius = cfg.camera_radius
+    if local_radius is None and len(scan_nodes) > 1:
+        local_radius = max(float(radius) * 0.5, 1e-6)
+    print(f"[render] Node sampling radius={local_radius}; seed={cfg.seed}")
+
+    print(f"[render] Executing Multi-Node Scan across {len(scan_nodes)} waypoints...")
+    for node_idx, node in enumerate(scan_nodes):
+        node_center = np.array(node, dtype=np.float32)
+        node_cfg = replace(cfg, camera_radius=local_radius, seed=cfg.seed + node_idx)
+        pos, look = _generate_camera_positions(means_np, n_positions, node_cfg, center_override=node_center)
+        for point, target in zip(pos, look):
+            # Drop coincident positions across nodes instead of multiplying evidence.
+            if cam_positions_list and np.min(np.linalg.norm(
+                    np.asarray(cam_positions_list) - point, axis=1)) < 1e-5:
+                print(f"[render] Skipped duplicate camera position at node {node_idx}")
+                continue
+            cam_positions_list.append(point)
+            look_targets_list.append(target)
+            camera_node_indices.append(node_idx)
+
+    cam_positions = np.asarray(cam_positions_list, dtype=np.float32)
+    look_targets = np.asarray(look_targets_list, dtype=np.float32)
+    # === #
+
     poses, position_indices = _build_poses(cam_positions, n_azimuth, n_elevation)
     total = len(poses)
-    print(f"[render] {n_positions} positions × {n_azimuth} azimuth × {n_elevation} elevation = {total} views"
+    unique_views = len({tuple(np.round(pose, 6).ravel()) for pose in poses})
+    if unique_views != total:
+        raise RuntimeError(f"Duplicate camera views: {unique_views}/{total}")
+    print(f"[render] Camera audit: positions={len(cam_positions)}, "
+          f"unique_views={unique_views}, total_views={total}")
+    print(f"[render] {n_positions} positions × {n_azimuth} azimuth × {n_elevation} elevation × {len(scan_nodes)} nodes = {total} views"
           f"  (batch={RENDER_BATCH}, io_workers={IO_WORKERS}, device={device})")
 
     # Build all w2c matrices on GPU in one shot — avoids per-frame tensor creation
     all_c2w = torch.tensor(np.stack(poses), device=device, dtype=torch.float32)  # (T, 4, 4)
     all_w2c = torch.linalg.inv(all_c2w)                                           # (T, 4, 4)
 
+    # === v3: Write transforms.json with camera intrinsics, scene bounds, and per-frame metadata ===
     transforms = {
         "fl_x": fl_x, "fl_y": fl_y, "cx": cx, "cy": cy,
         "w": width, "h": height,
         "scene_center": center.tolist(),
+        # v3.1: Force all coordinates in all nodes to standard Python floats
+        "scan_nodes": [[float(coord) for coord in node] for node in scan_nodes] if scan_nodes else [],
         "scene_radius": float(radius),
         "camera_positions": [p.tolist() for p in cam_positions],
+        "camera_node_indices": camera_node_indices,
+        "sampling_radius": local_radius,
+        "unique_view_count": unique_views,
         "look_targets": [t.tolist() for t in look_targets],
         "frames": [],
     }
@@ -561,6 +647,7 @@ def render_views(ply_path: str, job_dir: str, cfg: PipelineConfig | None = None)
                     "depth_path":       f"frames/depth_{idx:04d}.png",
                     "transform_matrix": poses[idx].tolist(),
                     "position_idx":     int(position_indices[idx]),
+                    "node_idx": int(camera_node_indices[position_indices[idx]]),
                 })
 
         # Drain futures — re-raises any disk write errors

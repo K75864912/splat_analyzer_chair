@@ -42,9 +42,26 @@ class PipelineConfig:
     seed: int = 42                          # deterministic placement
 
     # ── detection / clustering ─────────────────────────────────────────────
-    score_threshold: float = 0.12
-    min_votes: int = 8
-    min_peak_score: float = 0.40
+    score_threshold: float = 0.05
+    min_votes: int = 40
+    min_peak_score: float = 0.40            # we can lower bound for peak score to allow more detections
+
+    # === v3.3: max recognition results ===
+    max_results: int = None
+
+    # === v2: new manual control parameters ===
+    manual_center_x: float = None
+    manual_center_y: float = None
+    manual_center_z: float = None
+
+    # === v3: Multi-Node Spatial Scanning ===
+    scan_nodes: list = None       # List of [x, y, z] float arrays for multi-waypoint scanning
+    # --- v3.1: Auto Node Generation ---
+    num_nodes: int = 1                  # Number of nodes to auto-generate
+    node_spread_frac: float = 0.40      # How far from the center the extra nodes spread (fraction of scene radius)
+    
+    camera_radius: float = None   # to override the automatic scene radius detection
+    scene_radius: float = None    # for internal use only
 
     def apply_quality(self):
         """Expand the `quality` preset into the three camera-count fields."""

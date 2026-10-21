@@ -1,37 +1,56 @@
-# Base: PyTorch + CUDA 12.1 devel (devel variant needed to compile gsplat CUDA extensions)
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+# Use NVIDIA CUDA 12.4.1 development base image for L4 GPU compatibility[cite: 2]
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
 
-# System libs required by OpenCV
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgl1 libglib2.0-0 \
+# Prevent interactive prompts during apt installation[cite: 2]
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+# CRITICAL: Target compute architecture for NVIDIA L4 GPU (Ada Lovelace Arch 8.9)[cite: 2]
+# This ensures the CUDA extension is compiled specifically for L4 during the build phase.
+ENV TORCH_CUDA_ARCH_LIST=8.9
+
+# CRITICAL: Speed up the Ahead-Of-Time (AOT) C++ compilation process during docker build
+ENV MAX_JOBS=4
+
+# Install Python 3.10, compiler tools, build dependencies, and system libraries for OpenCV/3D graphics[cite: 2]
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
+    python3.10-dev \
+    git \
+    build-essential \
+    ninja-build \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
+
+# Set default python3 alias to python3.10[cite: 2]
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
 
 WORKDIR /app
 
-# CUDA architecture(s) to compile gsplat for.
-# Override at build time: docker build --build-arg CUDA_ARCH_LIST="8.9"
-# Common values: 8.0=A100, 8.6=RTX30xx, 8.9=L40S/RTX40xx, 9.0=H100
-ARG CUDA_ARCH_LIST="8.0;8.6;8.9"
-ENV TORCH_CUDA_ARCH_LIST="${CUDA_ARCH_LIST}"
+# Upgrade pip and fundamental build toolchains[cite: 2]
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Install Python deps (torch/torchvision come from the base image).
-# This layer is cached by Docker as long as requirements.txt doesn't change —
-# subsequent deploys that only touch app code skip the ~15-min gsplat compile.
+# Install PyTorch 2.4.1 ecosystem with CUDA 12.4 explicitly from PyTorch official wheel repository[cite: 2]
+RUN pip install --no-cache-dir torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu124
+
+# CRITICAL FIX: Force AOT compilation of gsplat from source during Docker build
+# By bypassing pre-built wheels (--no-binary), we force nvcc to compile the CUDA extension 
+# right now, baking it into the image and completely eliminating the 120s runtime JIT delay.
+RUN pip install --no-cache-dir --no-binary gsplat --no-build-isolation gsplat==1.5.3
+
+# Copy requirements and install remaining Python packages[cite: 2]
 COPY requirements.txt .
-RUN grep -vE '^(torch|torchvision)([>=<!]|$)' requirements.txt \
-    | pip install --no-cache-dir -r /dev/stdin
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Application code (rebuilt on every deploy)
-COPY server.py pipeline.py render_cameras.py config.py run_local.py ./
-COPY renderers/ ./renderers/
-COPY webapp/ ./webapp/
+# Copy all application source code[cite: 2]
+COPY . .
 
-# Persistent data:
-#   /data           → keys.db + HuggingFace model cache (mount as named volume)
-#   /tmp/workshop_jobs → job scratch space (mount as named volume)
-ENV DB_PATH="/data/keys.db"
-ENV HF_HOME="/data/hf_cache"
+# Expose default Cloud Run port[cite: 2]
+EXPOSE 8080
 
-EXPOSE 8000
-
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+# Start FastAPI using uvicorn 
+# "server:app" instructs uvicorn to look for the 'app' instance inside server.py
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080"]
