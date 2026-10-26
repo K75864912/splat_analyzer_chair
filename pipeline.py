@@ -1,7 +1,7 @@
 """
 Master pipeline:
   1. Render spherical camera views from multiple positions (render_cameras.py)
-  2. Run OWLv2 open-vocabulary detection on every frame
+  2. Run YOLOE-26 open-vocabulary detection on every frame
   3. Back-project 2D boxes to 3D using per-pixel depth maps
   4. Cluster per-label detections → single 3D bounding box per object
   5. Write interactions.json in WebXR format
@@ -170,7 +170,10 @@ def _cluster_detections(detections, eps_m=0.5, max_per_label=3,
 def _mask_world_position(mask, depth, K_inv, c2w, min_pixels=25):
     """Coordinatewise median of surface points, NOT a chair's physical center."""
     valid = mask & np.isfinite(depth) & (depth > .01)
-    y,x = np.nonzero(valid)
+    # Scan a contiguous one-dimensional mask, then recover row/column indices.
+    _nonzero_flat_idx = np.nonzero(valid.ravel(order="C"))[0]
+    y, x = np.divmod(_nonzero_flat_idx, valid.shape[1])
+    del _nonzero_flat_idx
     if len(x)<min_pixels: return None, {'valid_pixels':len(x)}
     z = depth[y,x].astype(np.float64)
     # Use every pixel (no stochastic sampling); pixel convention matches pipeline.
@@ -198,8 +201,37 @@ def _explicit_nms(boxes, scores, classes, threshold=0.60):
     return keep, removed
 
 
+def _predictor_head_end2end(model) -> bool:
+    """Read the network actually used by the predictor, after backend setup/fusion."""
+    backend = getattr(getattr(model, "predictor", None), "model", None)
+    network = getattr(backend, "model", None)
+    if network is None or not hasattr(network, "modules"):
+        raise RuntimeError("Cannot inspect the YOLO predictor; v5 expects Ultralytics 8.4.160")
+    heads = [m for m in network.modules() if hasattr(m, "end2end") and hasattr(m, "cv2")]
+    if not heads:
+        raise RuntimeError("No YOLO detection head found in the actual predictor")
+    head = heads[-1]
+    if bool(head.end2end) or head.cv2 is None:
+        raise RuntimeError("v5 expects the one-to-many head with nms=True; check Ultralytics 8.4.160")
+    return bool(head.end2end)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be 0/1, false/true, no/yes, or off/on")
+
+
 def _run_yoloe_26(frames_dir: Path, labels: list[str], transforms: dict, scene_radius: float,
-                    score_threshold: float = 0.12):
+                    score_threshold: float = 0.12, *,
+                    frame_cache: dict | None = None,
+                    verbose_detections: bool = False):
     """
     Run YOLOE-26 on all rendered frames.
     """
@@ -246,7 +278,11 @@ def _run_yoloe_26(frames_dir: Path, labels: list[str], transforms: dict, scene_r
         pose_key = tuple(np.round(np.asarray(frame_meta["transform_matrix"]), 6).ravel())
         frame_view_ids[frame_idx] = view_ids.setdefault(pose_key, len(view_ids))
         frame_path = frames_dir.parent / frame_meta["file_path"]
-        if frame_path.exists():
+        if frame_cache is not None:
+            if frame_idx not in frame_cache:
+                raise RuntimeError(f"Missing in-memory RGB/depth for frame {frame_idx}")
+            valid_frames.append((frame_idx, frame_meta, str(frame_path)))
+        elif frame_path.exists():
             valid_frames.append((frame_idx, frame_meta, str(frame_path)))
 
     # 4070 Super 拥有 12GB 显存，设为 32 或 64 是最安全的甜点区间
@@ -256,17 +292,25 @@ def _run_yoloe_26(frames_dir: Path, labels: list[str], transforms: dict, scene_r
     # 2. 手动分块 (Chunking)，强制切断 YOLO 一次性吞噬 960 张图的企图
     for i in range(0, len(valid_frames), YOLO_BATCH_SIZE):
         chunk_frames = valid_frames[i : i + YOLO_BATCH_SIZE]
-        chunk_paths = [item[2] for item in chunk_frames]
+        if frame_cache is None:
+            chunk_source = [item[2] for item in chunk_frames]
+        else:
+            # Renderer: HWC RGB uint8. Ultralytics ndarray input: HWC BGR uint8.
+            chunk_source = [
+                np.ascontiguousarray(frame_cache[item[0]][0][..., ::-1])
+                for item in chunk_frames
+            ]
 
         # Chunk size limits inputs per call; VRAM depends on model and images.
         results = model.predict(
-            source=chunk_paths, 
+            source=chunk_source,
             conf=score_threshold,           
             iou=0.85,            
             imgsz=max(W, H),     
             device=device,
             verbose=False,
-            stream=True
+            stream=True,
+            nms=True,  # Match the verified Ultralytics 8.4.160 one-to-many path.
         )
 
         # 3. 顺序遍历当前块的结果
@@ -305,7 +349,10 @@ def _run_yoloe_26(frames_dir: Path, labels: list[str], transforms: dict, scene_r
             # 👑 核心优化 2：只有在确定有物体时，才去硬盘读取笨重的 .npy 深度图
             depth_npy_path = (frames_dir.parent / frame_meta.get("depth_path", "").replace(".png", ".npy"))
             depth_map = None
-            if depth_npy_path.exists():
+            if frame_cache is not None:
+                # Keep the existing float64 localization arithmetic.
+                depth_map = frame_cache[frame_idx][1].astype(np.float64)
+            elif depth_npy_path.exists():
                 depth_map = np.load(str(depth_npy_path)).astype(np.float64)
 
             selected_masks = None
@@ -321,7 +368,7 @@ def _run_yoloe_26(frames_dir: Path, labels: list[str], transforms: dict, scene_r
                     mask_reason = "mask_shape_mismatch"
                 else:
                     # Preserve mask holes and align masks using the same NMS indices.
-                    selected_masks = res.masks.data[keep].cpu().numpy() > 0.5
+                    selected_masks = (res.masks.data[keep] > 0.5).cpu().numpy()
 
             # Keep old size estimates; change only the representative position.
             for det_idx, (box, score, cls_id) in enumerate(zip(boxes, scores, class_ids)):
@@ -370,8 +417,9 @@ def _run_yoloe_26(frames_dir: Path, labels: list[str], transforms: dict, scene_r
                     "view_id": frame_view_ids[frame_idx],
                     "box_2d":    [float(bx1), float(by1), float(bx2), float(by2)],
                 })
-                print(f"  [detect] {label} ({score:.2f}) depth={box_depth:.2f} "
-                      f"@ {world_pos.round(3)} {os.path.basename(frame_path_str)}")
+                if verbose_detections:
+                    print(f"  [detect] {label} ({score:.2f}) depth={box_depth:.2f} "
+                          f"@ {world_pos.round(3)} {os.path.basename(frame_path_str)}")
 
     with open(frames_dir.parent / "position_diagnostics.json", "w", encoding="utf-8") as f:
         json.dump(position_audit, f, indent=2)
@@ -380,7 +428,7 @@ def _run_yoloe_26(frames_dir: Path, labels: list[str], transforms: dict, scene_r
     after_total = sum(row["after"] for row in nms_audit)
     with open(frames_dir.parent / "nms_diagnostics.json", "w", encoding="utf-8") as f:
         json.dump({"post_nms_iou": post_nms_iou,
-                   "model_head_end2end": bool(getattr(model.model.model[-1], "end2end", False)),
+                   "model_head_end2end": _predictor_head_end2end(model),
                    "frames_processed": len(valid_frames),
                    "frames_with_boxes": len(nms_audit),
                    "before_total": before_total, "after_total": after_total,
@@ -421,8 +469,19 @@ def _write_numbered_views(job_dir, interactions, frame_annotations, marker_size)
 
 
 def run_pipeline(ply_path: str, prompt: str, job_dir: str,
-                 cfg: PipelineConfig | None = None) -> list[dict]:
+                 cfg: PipelineConfig | None = None, *,
+                 save_frames: bool | None = None,
+                 verbose_detections: bool | None = None) -> list[dict]:
+    """Run F_combined with per-job RAM inputs; optionally export debug frames.
+
+    Existing four-argument server/CLI calls remain valid. Small metadata and
+    final result JSON files are always written. Intermediate frames are opt-in.
+    """
     cfg = cfg or PipelineConfig()
+    if save_frames is None:
+        save_frames = _env_flag("SPLAT_SAVE_FRAMES")
+    if verbose_detections is None:
+        verbose_detections = _env_flag("SPLAT_VERBOSE_DETECTIONS")
     cluster_eps_frac = float(os.getenv("SPLAT_CLUSTER_EPS_FRAC", "0.09"))
     if not math.isfinite(cluster_eps_frac) or cluster_eps_frac <= 0:
         raise ValueError("SPLAT_CLUSTER_EPS_FRAC must be finite and positive")
@@ -430,27 +489,36 @@ def run_pipeline(ply_path: str, prompt: str, job_dir: str,
           f"cluster_eps_frac={cluster_eps_frac}")
     job_dir = Path(job_dir)
 
-    print("[pipeline] Step 1: Rendering camera views …")
-    transforms_path = render_cameras.render_views(ply_path, str(job_dir), cfg)
+    # Request-local ownership prevents frame reuse across pipeline invocations.
+    frame_cache = {}
+    try:
+        print("[pipeline] Step 1: Rendering camera views …")
+        transforms_path = render_cameras.render_views(
+            ply_path, str(job_dir), cfg, frame_cache=frame_cache, save_frames=save_frames)
 
-    with open(transforms_path) as f:
-        transforms = json.load(f)
+        with open(transforms_path) as f:
+            transforms = json.load(f)
 
-    frames_dir = job_dir / "frames"
+        frames_dir = job_dir / "frames"
 
-    cam_positions = np.array([
-        frame["transform_matrix"]
-        for frame in transforms["frames"]
-    ])[:, :3, 3]
-    scene_radius = float(np.linalg.norm(cam_positions, axis=1).mean())
+        cam_positions = np.array([
+            frame["transform_matrix"]
+            for frame in transforms["frames"]
+        ])[:, :3, 3]
+        scene_radius = float(np.linalg.norm(cam_positions, axis=1).mean())
 
-    labels = [l.strip() for l in prompt.split(",") if l.strip()]
-    if not labels:
-        raise ValueError("prompt must contain at least one label")
+        labels = [l.strip() for l in prompt.split(",") if l.strip()]
+        if not labels:
+            raise ValueError("prompt must contain at least one label")
 
-    print(f"[pipeline] Step 2: Detecting {labels} in {len(transforms['frames'])} frames using YOLOE-26 …")
-    raw_detections = _run_yoloe_26(frames_dir, labels, transforms, scene_radius,
-                                     score_threshold=cfg.score_threshold)
+        print(f"[pipeline] Step 2: Detecting {labels} in {len(transforms['frames'])} frames using YOLOE-26 …")
+        raw_detections = _run_yoloe_26(frames_dir, labels, transforms, scene_radius,
+                                         score_threshold=cfg.score_threshold,
+                                         frame_cache=frame_cache,
+                                         verbose_detections=verbose_detections)
+
+    finally:
+        frame_cache.clear()
 
     frame_annotations: dict = {}   # frame_idx (str) → [{label, object_idx, box, score}]
 
@@ -572,6 +640,10 @@ if __name__ == "__main__":
     parser.add_argument("--score_threshold",  type=float, default=_d.score_threshold)
     parser.add_argument("--min_votes",        type=int,   default=_d.min_votes)
     parser.add_argument("--min_peak_score",   type=float, default=_d.min_peak_score)
+    parser.add_argument("--save_frames", action="store_true", default=None,
+                        help="Also save RGB PNG, depth NPY and depth preview for debugging")
+    parser.add_argument("--verbose_detections", action="store_true", default=None,
+                        help="Enable per-detection logs")
     args = parser.parse_args()
     cfg = PipelineConfig.from_overrides(
         quality=args.quality,
@@ -579,5 +651,7 @@ if __name__ == "__main__":
         min_votes=args.min_votes,
         min_peak_score=args.min_peak_score,
     )
-    result = run_pipeline(args.ply, args.prompt, args.job_dir, cfg)
+    result = run_pipeline(args.ply, args.prompt, args.job_dir, cfg,
+                          save_frames=args.save_frames,
+                          verbose_detections=args.verbose_detections)
     print(json.dumps(result, indent=2))

@@ -45,7 +45,8 @@ class GsplatRenderer(Renderer):
             sh_degree=g["sh_degree"],
             near_plane=NEAR_PLANE, far_plane=FAR_PLANE,
         )
-        return (rgb_out.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)  # (B,H,W,3)
+        # Quantize before download: same RGB uint8 values, one byte/channel.
+        return rgb_out.clamp(0, 1).mul(255).to(torch.uint8).cpu().numpy()
 
     def render_depth(self, g, w2c, K, width, height):
         B = w2c.shape[0]

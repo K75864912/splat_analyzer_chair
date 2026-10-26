@@ -14,12 +14,14 @@ transforms.json gains two extra keys:
 """
 
 import argparse
+import os
 import gzip
 import json
 import math
 import struct
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -32,9 +34,11 @@ from renderers import get_renderer
 
 # Number of camera views rendered in a single GPU call (RGB pass).
 # Increase if you have lots of VRAM; decrease if you hit OOM.
-RENDER_BATCH = 64
+RENDER_BATCH = int(os.getenv("SPLAT_RENDER_BATCH", "16"))
 # Parallel threads for PNG / NPY disk writes.
-IO_WORKERS = 16
+IO_WORKERS = int(os.getenv("SPLAT_IO_WORKERS", "4"))
+if RENDER_BATCH < 1 or IO_WORKERS < 1:
+    raise ValueError("Render batch and I/O workers must be positive")
 
 
 # ---------------------------------------------------------------------------
@@ -479,9 +483,17 @@ def _write_frame(frames_dir: Path, idx: int,
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def render_views(ply_path: str, job_dir: str, cfg: PipelineConfig | None = None):
+def render_views(ply_path: str, job_dir: str, cfg: PipelineConfig | None = None, *,
+                 frame_cache: dict | None = None, save_frames: bool = True):
     """
-    Render RGB + depth from multiple camera positions and write:
+    Render RGB + depth; return the transforms.json path as before.
+
+    frame_cache, when supplied, must be empty and owned by this request. It is
+    populated as {frame_idx: (rgb_uint8_hwc, depth_float32_hw)}. No global cache
+    is used. Set save_frames=False with a cache to skip intermediate image/NPY
+    encoding and depth-preview conversion. Legacy callers still save by default.
+
+    With save_frames=True, write:
       <job_dir>/frames/frame_XXXX.png
       <job_dir>/frames/depth_XXXX.png   (colorized, for display)
       <job_dir>/frames/depth_XXXX.npy   (raw float, for pipeline depth lookup)
@@ -492,6 +504,10 @@ def render_views(ply_path: str, job_dir: str, cfg: PipelineConfig | None = None)
     the GPU stays continuously loaded. Disk writes run in a thread pool
     overlapping with the next GPU batch.
     """
+    if frame_cache is None and not save_frames:
+        raise ValueError("save_frames=False requires a request-local frame_cache")
+    if frame_cache is not None and frame_cache:
+        raise ValueError("Pass a fresh empty frame_cache for each render job")
     cfg = cfg or PipelineConfig()
     width, height = cfg.width, cfg.height
     n_positions, n_azimuth, n_elevation = cfg.n_positions, cfg.n_azimuth, cfg.n_elevation
@@ -623,7 +639,7 @@ def render_views(ply_path: str, job_dir: str, cfg: PipelineConfig | None = None)
 
     futures = []
 
-    with ThreadPoolExecutor(max_workers=IO_WORKERS) as pool:
+    with (ThreadPoolExecutor(max_workers=IO_WORKERS) if save_frames else nullcontext(None)) as pool:
         for b0 in range(0, total, RENDER_BATCH):
             b1 = min(b0 + RENDER_BATCH, total)
             B = b1 - b0
@@ -638,10 +654,13 @@ def render_views(ply_path: str, job_dir: str, cfg: PipelineConfig | None = None)
 
             # ── Submit I/O to thread pool (overlaps with next GPU batch) ───────
             for bi, idx in enumerate(range(b0, b1)):
-                futures.append(pool.submit(
-                    _write_frame, frames_dir, idx,
-                    rgb_cpu[bi], depth_cpu[bi], _depth_to_vis(depth_cpu[bi]),
-                ))
+                if frame_cache is not None:
+                    frame_cache[idx] = (rgb_cpu[bi], depth_cpu[bi])
+                if save_frames:
+                    futures.append(pool.submit(
+                        _write_frame, frames_dir, idx,
+                        rgb_cpu[bi], depth_cpu[bi], _depth_to_vis(depth_cpu[bi]),
+                    ))
                 transforms["frames"].append({
                     "file_path":        f"frames/frame_{idx:04d}.png",
                     "depth_path":       f"frames/depth_{idx:04d}.png",
@@ -658,7 +677,8 @@ def render_views(ply_path: str, job_dir: str, cfg: PipelineConfig | None = None)
     with open(transforms_path, "w") as f:
         json.dump(transforms, f, indent=2)
 
-    print(f"[render] Done. Wrote {total} RGB + depth frames + transforms.json")
+    location = "RAM + disk" if frame_cache is not None and save_frames else ("disk" if save_frames else "RAM")
+    print(f"[render] Done. {total} RGB + depth frames in {location}; wrote transforms.json")
     return str(transforms_path)
 
 
