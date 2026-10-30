@@ -102,7 +102,11 @@ async def run_analyzer(
         )
         
         # 5. Return the JSON payload directly to Unity
-        return {"objects": interactions}
+        # Keep the deployed v3 HTTP field set; v4 metadata remains in local exports.
+        public_fields = ("label", "position", "rotation", "scale", "frames")
+        return {"objects": [
+            {key: obj[key] for key in public_fields} for obj in interactions
+        ]}
         
     except Exception as e:
         import traceback
